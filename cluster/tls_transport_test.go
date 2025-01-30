@@ -15,6 +15,7 @@ package cluster
 
 import (
 	"bufio"
+	"bytes"
 	context2 "context"
 	"fmt"
 	"io"
@@ -23,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 )
 
-var logger = log.NewNopLogger()
+var logger = promslog.NewNopLogger()
 
 func freeport() int {
 	lis, _ := net.Listen(network, "127.0.0.1:0")
@@ -42,7 +43,7 @@ func newTLSTransport(file, address string, port int) (*TLSTransport, error) {
 		return nil, err
 	}
 
-	return NewTLSTransport(context2.Background(), log.NewNopLogger(), nil, address, port, cfg)
+	return NewTLSTransport(context2.Background(), promslog.NewNopLogger(), nil, address, port, cfg)
 }
 
 func TestNewTLSTransport(t *testing.T) {
@@ -128,14 +129,14 @@ func TestFinalAdvertiseAddr(t *testing.T) {
 	for _, tc := range testCases {
 		tlsConf := loadTLSTransportConfig(t, "testdata/tls_config_node1.yml")
 		transport, err := NewTLSTransport(context2.Background(), logger, nil, tc.bindAddr, tc.bindPort, tlsConf)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		ip, port, err := transport.FinalAdvertiseAddr(tc.inputIP, tc.inputPort)
 		if len(tc.expectedError) > 0 {
 			require.Equal(t, tc.expectedError, err.Error())
 		} else {
-			require.Nil(t, err)
+			require.NoError(t, err)
 			if tc.expectedPort == 0 {
-				require.True(t, tc.expectedPort < port)
+				require.Less(t, tc.expectedPort, port)
 			} else {
 				require.Equal(t, tc.expectedPort, port)
 			}
@@ -162,7 +163,7 @@ func TestWriteTo(t *testing.T) {
 	to := fmt.Sprintf("%s:%d", t2.bindAddr, t2.GetAutoBindPort())
 	sent := []byte(("test packet"))
 	_, err := t1.WriteTo(sent, to)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	packet := <-t2.PacketCh()
 	require.Equal(t, sent, packet.Buf)
 	require.Equal(t, from, packet.From.String())
@@ -183,7 +184,7 @@ func BenchmarkWriteTo(b *testing.B) {
 	sent := []byte(("test packet"))
 
 	_, err := t1.WriteTo(sent, to)
-	require.Nil(b, err)
+	require.NoError(b, err)
 	packet := <-t2.PacketCh()
 
 	require.Equal(b, sent, packet.Buf)
@@ -193,17 +194,17 @@ func BenchmarkWriteTo(b *testing.B) {
 func TestDialTimeout(t *testing.T) {
 	tlsConf1 := loadTLSTransportConfig(t, "testdata/tls_config_node1.yml")
 	t1, err := NewTLSTransport(context2.Background(), logger, nil, "127.0.0.1", 0, tlsConf1)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	defer t1.Shutdown()
 
 	tlsConf2 := loadTLSTransportConfig(t, "testdata/tls_config_node2.yml")
 	t2, err := NewTLSTransport(context2.Background(), logger, nil, "127.0.0.1", 0, tlsConf2)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	defer t2.Shutdown()
 
 	addr := fmt.Sprintf("%s:%d", t2.bindAddr, t2.GetAutoBindPort())
 	from, err := t1.DialTimeout(addr, 5*time.Second)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	defer from.Close()
 
 	var to net.Conn
@@ -216,38 +217,34 @@ func TestDialTimeout(t *testing.T) {
 
 	sent := []byte(("test stream"))
 	m, err := from.Write(sent)
-	require.Nil(t, err)
-	require.Greater(t, m, 0)
+	require.NoError(t, err)
+	require.Positive(t, m)
 
 	wg.Wait()
 
 	reader := bufio.NewReader(to)
 	buf := make([]byte, len(sent))
 	n, err := io.ReadFull(reader, buf)
-	require.Nil(t, err)
-	require.Equal(t, len(sent), n)
+	require.NoError(t, err)
+	require.Len(t, sent, n)
 	require.Equal(t, sent, buf)
 }
 
-type logWr struct {
-	bytes []byte
-}
-
-func (l *logWr) Write(p []byte) (n int, err error) {
-	l.bytes = append(l.bytes, p...)
-	return len(p), nil
-}
-
 func TestShutdown(t *testing.T) {
+	var buf bytes.Buffer
+	promslogConfig := &promslog.Config{Writer: &buf}
+	logger := promslog.New(promslogConfig)
+	// Set logger to debug, otherwise it won't catch some logging from `Shutdown()` method.
+	_ = promslogConfig.Level.Set("debug")
+
 	tlsConf1 := loadTLSTransportConfig(t, "testdata/tls_config_node1.yml")
-	l := &logWr{}
-	t1, _ := NewTLSTransport(context2.Background(), log.NewLogfmtLogger(l), nil, "127.0.0.1", 0, tlsConf1)
+	t1, _ := NewTLSTransport(context2.Background(), logger, nil, "127.0.0.1", 0, tlsConf1)
 	// Sleeping to make sure listeners have started and can subsequently be shut down gracefully.
 	time.Sleep(500 * time.Millisecond)
 	err := t1.Shutdown()
-	require.Nil(t, err)
-	require.NotContains(t, string(l.bytes), "use of closed network connection")
-	require.Contains(t, string(l.bytes), "shutting down tls transport")
+	require.NoError(t, err)
+	require.NotContains(t, buf.String(), "use of closed network connection")
+	require.Contains(t, buf.String(), "shutting down tls transport")
 }
 
 func loadTLSTransportConfig(tb testing.TB, filename string) *TLSTransportConfig {
